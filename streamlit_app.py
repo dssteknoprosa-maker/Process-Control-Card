@@ -160,6 +160,130 @@ def pilih_atau_baru(label: str, pilihan: list, kunci: str) -> str:
     return terpilih
 
 
+MODE_LEWATI = "Lewati yang sudah ada (aman)"
+MODE_TIMPA = "Timpa yang sudah ada (perbarui persen, satuan, fase, waktu, keterangan)"
+
+
+def baca_formulasi(f) -> dict:
+    """Ubah file Kartu Kendali Proses menjadi data formulasi + info waktu/keterangan per fase."""
+    daftar, info = baca_file(f)
+    rec, info_fase, catatan, langkah = [], {}, [], set()
+    for e in daftar:
+        jenis, tahap = rapikan(e["jenis"]).title(), rapikan(e["tahapan"]).title()
+        if (jenis, tahap) in langkah:
+            catatan.append(f"{jenis} / {tahap} muncul lebih dari sekali di file; yang pertama dipakai.")
+            continue
+        langkah.add((jenis, tahap))
+        nama_ada = set()
+        for r in e["rows"]:
+            nama, persen = rapikan(r["senyawa"]), r["persen"]
+            if persen is None or pd.isna(persen) or persen <= 0:
+                catatan.append(f"{jenis} / {tahap} / {nama}: persen tidak valid, dilewati.")
+                continue
+            if nama.lower() in nama_ada:
+                catatan.append(f"{jenis} / {tahap} / {nama}: nama senyawa ganda, dilewati.")
+                continue
+            nama_ada.add(nama.lower())
+            fase = int(r["fase"])
+            rec.append({"jenis_kulit": jenis, "tahapan": tahap, "senyawa": nama,
+                        "persen": float(persen), "satuan": r["satuan"], "fase": fase})
+            w, k = (r.get("waktu") or "").strip(), (r.get("keterangan") or "").strip()
+            if w or k:
+                info_fase[(jenis, tahap, fase)] = (w, k)
+    if info.get("gagal"):
+        catatan.append(f"{info['gagal']} baris bahan kimia tidak terbaca "
+                       "(formatnya harus 'persen (jumlah satuan)').")
+    return {"formulasi": rec, "info": info_fase, "catatan": catatan}
+
+
+def simpan_impor(hasil: dict, mode: str) -> str:
+    """Simpan hasil baca file ke database. Return ringkasan hasil."""
+    ada = {(r.jenis_kulit, r.tahapan, r.senyawa.lower()): int(r.id)
+           for r in ambil_semua().itertuples()}
+    baru, ubah, lewat = [], [], 0
+    for r in hasil["formulasi"]:
+        kunci = (r["jenis_kulit"], r["tahapan"], r["senyawa"].lower())
+        if kunci not in ada:
+            baru.append(r)
+        elif mode == MODE_TIMPA:
+            ubah.append((ada[kunci], {"persen": r["persen"], "satuan": r["satuan"],
+                                      "fase": r["fase"]}))
+        else:
+            lewat += 1
+    if baru:
+        jalankan(lambda: db().table(TABEL).insert(baru).execute())
+    for id_, data in ubah:
+        jalankan(lambda: db().table(TABEL).update(data).eq("id", id_).execute())
+
+    n_info = 0
+    try:
+        info_ada = ambil_info()
+        daftar_info = [{"jenis_kulit": j, "tahapan": t, "fase": f, "waktu": w, "keterangan": k}
+                       for (j, t, f), (w, k) in hasil["info"].items()
+                       if mode == MODE_TIMPA or (j, t, f) not in info_ada]
+        if daftar_info:
+            jalankan(lambda: db().table("tahapan_info").upsert(
+                daftar_info, on_conflict="jenis_kulit,tahapan,fase").execute())
+        n_info = len(daftar_info)
+    except DBError as e:
+        return (f"⚠️ Formulasi tersimpan ({len(baru)} baru, {len(ubah)} diperbarui, "
+                f"{lewat} dilewati), tapi waktu & keterangan gagal: {e}")
+    return (f"✅ Impor selesai: {len(baru)} bahan baru, {len(ubah)} diperbarui, "
+            f"{lewat} dilewati; waktu & keterangan {n_info} fase.")
+
+
+def bagian_impor():
+    """Impor formulasi dari file Kartu Kendali Proses (.xlsx)."""
+    n = st.session_state.get("imp_n", 0)
+    with st.expander("📥 Impor dari file Kartu Kendali Proses (.xlsx)",
+                     expanded="impor" in st.session_state):
+        st.caption("Aplikasi membaca tahapan, bahan kimia, persen, satuan, fase (sel Waktu yang "
+                   "digabung = satu fase), waktu, dan keterangan dari file. Jenis kulit diambil "
+                   "dari baris 'Berat Kulit ...'. Kamu bisa cek hasilnya dulu sebelum disimpan.")
+        f = st.file_uploader("File Kartu Kendali Proses (.xlsx)", type=["xlsx"], key=f"imp_{n}")
+        if f is not None and st.button("🔍 Baca file"):
+            try:
+                st.session_state["impor"] = baca_formulasi(f)
+            except Exception as e:  # noqa: BLE001
+                st.session_state.pop("impor", None)
+                st.error(f"❌ Gagal membaca file: {str(e)[:250]}")
+
+        hasil = st.session_state.get("impor")
+        if not hasil:
+            return
+        if not hasil["formulasi"]:
+            st.warning("Tidak ada bahan kimia yang terdeteksi.")
+            return
+        prev = pd.DataFrame(hasil["formulasi"])
+        wk = [hasil["info"].get((r.jenis_kulit, r.tahapan, r.fase), ("", "")) for r in prev.itertuples()]
+        prev["waktu"], prev["keterangan"] = [w[0] for w in wk], [w[1] for w in wk]
+        st.success(f"Terdeteksi {len(prev)} bahan kimia di "
+                   f"{prev.groupby(['jenis_kulit', 'tahapan']).ngroups} tahapan.")
+        for c in hasil["catatan"]:
+            st.warning(c)
+        st.dataframe(prev.rename(columns={
+            "jenis_kulit": "Jenis Kulit", "tahapan": "Tahapan", "senyawa": "Senyawa",
+            "persen": "Persen (%)", "satuan": "Satuan", "fase": "Fase",
+            "waktu": "Waktu (menit)", "keterangan": "Keterangan"}),
+            hide_index=True, use_container_width=True)
+        mode = st.radio("Kalau jenis kulit + tahapan + senyawa sudah ada di database:",
+                        [MODE_LEWATI, MODE_TIMPA], key="imp_mode")
+        c1, c2 = st.columns(2)
+        if c1.button("💾 Simpan ke database", type="primary"):
+            try:
+                pesan = simpan_impor(hasil, mode)
+            except DBError as e:
+                st.error(f"❌ {e}")
+            else:
+                st.session_state.pop("impor", None)
+                st.session_state["imp_n"] = n + 1
+                flash("warning" if pesan.startswith("⚠️") else "success", pesan)
+        if c2.button("Batal"):
+            st.session_state.pop("impor", None)
+            st.session_state["imp_n"] = n + 1
+            st.rerun()
+
+
 def bagian_info_tahapan(df: pd.DataFrame):
     """Atur waktu (menit) dan keterangan untuk tiap fase dalam sebuah tahapan."""
     st.divider()
@@ -232,6 +356,8 @@ def halaman_developer():
 
     jenis_list = sorted(df["jenis_kulit"].unique().tolist())
     tahap_list = list(dict.fromkeys(df["tahapan"].tolist()))
+
+    bagian_impor()
 
     st.subheader("Tambah formulasi")
     c1, c2 = st.columns(2)
