@@ -164,9 +164,9 @@ MODE_LEWATI = "Lewati yang sudah ada (aman)"
 MODE_TIMPA = "Timpa yang sudah ada (perbarui persen, satuan, fase, waktu, keterangan)"
 
 
-def baca_formulasi(f) -> dict:
+def baca_formulasi(f, sheet=None) -> dict:
     """Ubah file Kartu Kendali Proses menjadi data formulasi + info waktu/keterangan per fase."""
-    daftar, info = baca_file(f)
+    daftar, info = baca_file(f, sheet)
     rec, info_fase, catatan, langkah = [], {}, [], set()
     for e in daftar:
         jenis, tahap = rapikan(e["jenis"]).title(), rapikan(e["tahapan"]).title()
@@ -232,18 +232,188 @@ def simpan_impor(hasil: dict, mode: str) -> str:
             f"{lewat} dilewati; waktu & keterangan {n_info} fase.")
 
 
+def deteksi_format(f) -> dict:
+    """Return {nama_sheet: 'kartu' | 'resep'} untuk sheet yang formatnya dikenali."""
+    wb = load_workbook(f, data_only=True)
+    hasil = {}
+    for ws in wb.worksheets:
+        for r in range(1, min(ws.max_row, 40) + 1):
+            a, b = ws.cell(r, 1).value, ws.cell(r, 2).value
+            if isinstance(a, str) and isinstance(b, str):
+                ka, kb = a.strip().lower(), b.strip().lower()
+                if ka == "tanggal" and kb == "proses":
+                    hasil[ws.title] = "kartu"
+                    break
+                if ka == "tahap" and kb == "bahan":
+                    hasil[ws.title] = "resep"
+                    break
+    return hasil
+
+
+def _teks(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def _bentuk_fase(rows: list) -> list:
+    """Kelompokkan bahan dalam satu tahap menjadi fase.
+    Sel Waktu yang digabung = satu fase. Baris tanpa waktu & keterangan ikut fase
+    berikutnya yang punya waktu (waktu biasanya ditulis di baris terakhir kelompok)."""
+    unit = []
+    for row in rows:
+        if row["gid"] is not None and unit and unit[-1]["gid"] == row["gid"]:
+            unit[-1]["rows"].append(row)
+        else:
+            unit.append({"gid": row["gid"], "rows": [row]})
+    fases, cur = [], []
+    for u in unit:
+        cur += u["rows"]
+        if any(nilai_teks(x["waktu"]) or nilai_teks(x["ket"]) for x in u["rows"]):
+            fases.append(cur)
+            cur = []
+    if cur:
+        if fases:
+            fases[-1] += cur
+        else:
+            fases.append(cur)
+    return fases
+
+
+def baca_resep(f, sheet: str, jenis: str) -> dict:
+    """Baca format resep: kolom Tahap | Bahan | Jumlah (%) | Waktu (menit) | Keterangan."""
+    wb = load_workbook(f, data_only=True)
+    ws = wb[sheet]
+
+    kol, mulai = {}, None
+    for r in range(1, min(ws.max_row, 40) + 1):
+        a, b = _teks(ws.cell(r, 1).value).lower(), _teks(ws.cell(r, 2).value).lower()
+        if a == "tahap" and b == "bahan":
+            for k in range(1, 12):
+                t = _teks(ws.cell(r, k).value).lower()
+                for nama in ("tahap", "bahan", "jumlah", "waktu", "keterangan"):
+                    if t.startswith(nama) and nama not in kol:
+                        kol[nama] = k
+            mulai = r + 1
+            break
+    if mulai is None or not all(k in kol for k in ("tahap", "bahan", "jumlah")):
+        raise ValueError("Header Tahap | Bahan | Jumlah (%) tidak ditemukan di sheet ini.")
+    kd, ke = kol.get("waktu"), kol.get("keterangan")
+
+    grup_d = {}  # baris -> baris pertama dari sel Waktu yang digabung vertikal
+    if kd:
+        for rng in ws.merged_cells.ranges:
+            if rng.max_row > rng.min_row and rng.min_col <= kd <= rng.max_col:
+                for rr in range(rng.min_row, rng.max_row + 1):
+                    grup_d[rr] = rng.min_row
+
+    tahap_raw, tahap_final = None, None
+    kemunculan, data, seen, catatan, kaki, diganti = {}, {}, {}, [], {}, []
+    for r in range(mulai, ws.max_row + 1):
+        a = _teks(ws.cell(r, kol["tahap"]).value)
+        b = _teks(ws.cell(r, kol["bahan"]).value)
+        c = ws.cell(r, kol["jumlah"]).value
+        d = ws.cell(grup_d.get(r, r), kd).value if kd else None
+        e = ws.cell(r, ke).value if ke else None
+        if not (a or b or c is not None or _teks(d) or _teks(e)):
+            continue
+        m = re.match(r"^(?:keterangan\s*:)?\s*(\*+)\s*(.+)$", a, re.I)
+        if m and not b:  # catatan kaki, mis. "Keterangan : ** dilarutkan ..."
+            kaki[m.group(1)] = m.group(2).strip()
+            continue
+        if a and a.casefold() != (tahap_raw or "").casefold():
+            tahap_raw, tahap_final = a, None
+        if not b:
+            bagian = [x for x in (a, nilai_teks(d), nilai_teks(e)) if x]
+            catatan.append(f"Baris {r} dilewati (tanpa bahan): " + " | ".join(bagian))
+            continue
+        try:
+            persen = float(_teks(c).replace(",", "."))
+        except ValueError:
+            persen = None
+        if persen is None or persen <= 0:
+            catatan.append(f"Baris {r}: {b} dilewati (jumlah % tidak valid: {_teks(c) or 'kosong'}).")
+            continue
+        if tahap_raw is None:
+            catatan.append(f"Baris {r}: {b} dilewati (belum ada nama tahap).")
+            continue
+        if tahap_final is None:
+            key = tahap_raw.casefold()
+            kemunculan[key] = kemunculan.get(key, 0) + 1
+            dasar = rapikan(tahap_raw).title()
+            tahap_final = dasar if kemunculan[key] == 1 else f"{dasar} ({kemunculan[key]})"
+            if kemunculan[key] > 1:
+                diganti.append(f"Tahap '{dasar}' muncul lagi, dinamai '{tahap_final}'.")
+            data[tahap_final], seen[tahap_final] = [], {}
+        bintang = re.search(r"\*+$", b)
+        nama = rapikan(re.sub(r"\*+$", "", b))
+        n = seen[tahap_final][nama.casefold()] = seen[tahap_final].get(nama.casefold(), 0) + 1
+        if n > 1:
+            diganti.append(f"{tahap_final}: bahan '{nama}' muncul lagi, dinamai '{nama} ({n})'.")
+            nama = f"{nama} ({n})"
+        data[tahap_final].append({"nama": nama, "persen": persen, "gid": grup_d.get(r),
+                                  "waktu": d, "ket": e,
+                                  "bintang": bintang.group(0) if bintang else ""})
+
+    rec, info_fase = [], {}
+    for tahap, rows in data.items():
+        for no, fase in enumerate(_bentuk_fase(rows), 1):
+            waktu = next((nilai_teks(x["waktu"]) for x in fase if nilai_teks(x["waktu"])), "")
+            kets = []
+            for x in fase:
+                for t in (nilai_teks(x["ket"]),
+                          f"{x['nama']}: {kaki[x['bintang']]}" if x["bintang"] in kaki else ""):
+                    if t and t not in kets:
+                        kets.append(t)
+            for x in fase:
+                rec.append({"jenis_kulit": jenis, "tahapan": tahap, "senyawa": x["nama"],
+                            "persen": x["persen"], "fase": no,
+                            "satuan": "mL" if x["nama"].casefold().startswith("air") else "g"})
+            if waktu or kets:
+                info_fase[(jenis, tahap, no)] = (waktu, "; ".join(kets))
+    if len(catatan) > 12:
+        catatan = catatan[:12] + [f"... dan {len(catatan) - 12} baris lain dilewati."]
+    return {"formulasi": rec, "info": info_fase, "catatan": diganti + catatan,
+            "format": "resep"}
+
+
 def bagian_impor():
-    """Impor formulasi dari file Kartu Kendali Proses (.xlsx)."""
+    """Impor formulasi dari file Kartu Kendali Proses atau file Resep (.xlsx)."""
     n = st.session_state.get("imp_n", 0)
-    with st.expander("📥 Impor dari file Kartu Kendali Proses (.xlsx)",
+    with st.expander("📥 Impor dari file Excel (Kartu Kendali Proses / Resep)",
                      expanded="impor" in st.session_state):
-        st.caption("Aplikasi membaca tahapan, bahan kimia, persen, satuan, fase (sel Waktu yang "
-                   "digabung = satu fase), waktu, dan keterangan dari file. Jenis kulit diambil "
-                   "dari baris 'Berat Kulit ...'. Kamu bisa cek hasilnya dulu sebelum disimpan.")
-        f = st.file_uploader("File Kartu Kendali Proses (.xlsx)", type=["xlsx"], key=f"imp_{n}")
-        if f is not None and st.button("🔍 Baca file"):
+        st.caption("Format dikenali otomatis: **Kartu Kendali Proses** (kolom Tanggal | Proses | "
+                   "Bahan Kimia | ...) atau **Resep** (kolom Tahap | Bahan | Jumlah (%) | Waktu | "
+                   "Keterangan). Sel Waktu yang digabung dianggap satu fase. Hasilnya bisa dicek "
+                   "dulu sebelum disimpan.")
+        f = st.file_uploader("File Excel (.xlsx)", type=["xlsx"], key=f"imp_{n}")
+        sheet, fmt, jenis_manual = None, None, ""
+        if f is not None:
             try:
-                st.session_state["impor"] = baca_formulasi(f)
+                deteksi = deteksi_format(f)
+            except Exception as e:  # noqa: BLE001
+                deteksi = {}
+                st.error(f"❌ Gagal membuka file: {str(e)[:200]}")
+            if not deteksi:
+                st.warning("Format file tidak dikenali. Header tabel harus 'Tanggal | Proses' "
+                           "(Kartu Kendali) atau 'Tahap | Bahan' (Resep).")
+            else:
+                sheet = (st.selectbox("Sheet", list(deteksi), key=f"imp_sheet_{n}")
+                         if len(deteksi) > 1 else next(iter(deteksi)))
+                fmt = deteksi[sheet]
+                st.caption("Format terdeteksi: " + ("Kartu Kendali Proses" if fmt == "kartu"
+                                                   else "Resep (Tahap | Bahan | Jumlah)"))
+                if fmt == "resep":
+                    jenis_manual = rapikan(st.text_input(
+                        "Jenis kulit untuk resep ini (tidak ada di file)", key=f"imp_jenis_{n}",
+                        placeholder="contoh: Biawak"))
+        if fmt and st.button("🔍 Baca file"):
+            st.session_state["imp_ver"] = st.session_state.get("imp_ver", 0) + 1
+            try:
+                if fmt == "resep":
+                    if not jenis_manual:
+                        raise ValueError("Isi dulu jenis kulit untuk resep ini.")
+                    st.session_state["impor"] = baca_resep(f, sheet, jenis_manual.title())
+                else:
+                    st.session_state["impor"] = baca_formulasi(f, sheet)
             except Exception as e:  # noqa: BLE001
                 st.session_state.pop("impor", None)
                 st.error(f"❌ Gagal membaca file: {str(e)[:250]}")
@@ -255,23 +425,34 @@ def bagian_impor():
             st.warning("Tidak ada bahan kimia yang terdeteksi.")
             return
         prev = pd.DataFrame(hasil["formulasi"])
-        wk = [hasil["info"].get((r.jenis_kulit, r.tahapan, r.fase), ("", "")) for r in prev.itertuples()]
+        wk = [hasil["info"].get((r.jenis_kulit, r.tahapan, r.fase), ("", ""))
+              for r in prev.itertuples()]
         prev["waktu"], prev["keterangan"] = [w[0] for w in wk], [w[1] for w in wk]
         st.success(f"Terdeteksi {len(prev)} bahan kimia di "
                    f"{prev.groupby(['jenis_kulit', 'tahapan']).ngroups} tahapan.")
+        if hasil.get("format") == "resep":
+            st.info("File resep tidak punya satuan. Default: Air = mL, bahan lain = g. "
+                    "Ubah langsung di kolom Satuan pada tabel di bawah kalau perlu.")
         for c in hasil["catatan"]:
             st.warning(c)
-        st.dataframe(prev.rename(columns={
+        tabel = prev.rename(columns={
             "jenis_kulit": "Jenis Kulit", "tahapan": "Tahapan", "senyawa": "Senyawa",
             "persen": "Persen (%)", "satuan": "Satuan", "fase": "Fase",
-            "waktu": "Waktu (menit)", "keterangan": "Keterangan"}),
-            hide_index=True, use_container_width=True)
+            "waktu": "Waktu (menit)", "keterangan": "Keterangan"})
+        edit = st.data_editor(
+            tabel, hide_index=True, width="stretch",
+            disabled=[c for c in tabel.columns if c != "Satuan"],
+            column_config={"Satuan": st.column_config.SelectboxColumn(
+                "Satuan", options=list(SATUAN), required=True)},
+            key=f"imp_editor_{n}_{st.session_state.get('imp_ver', 0)}")
         mode = st.radio("Kalau jenis kulit + tahapan + senyawa sudah ada di database:",
                         [MODE_LEWATI, MODE_TIMPA], key="imp_mode")
         c1, c2 = st.columns(2)
         if c1.button("💾 Simpan ke database", type="primary"):
+            final = {**hasil, "formulasi": [
+                {**r, "satuan": sat} for r, sat in zip(hasil["formulasi"], edit["Satuan"])]}
             try:
-                pesan = simpan_impor(hasil, mode)
+                pesan = simpan_impor(final, mode)
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
@@ -342,7 +523,7 @@ def bagian_info_tahapan(df: pd.DataFrame):
         st.dataframe(pd.DataFrame(
             [{"Jenis Kulit": j, "Tahapan": t, "Fase": f, "Waktu (menit)": w, "Keterangan": k}
              for (j, t, f), (w, k) in sorted(info.items())]),
-            hide_index=True, use_container_width=True)
+            hide_index=True, width="stretch")
 
 
 def halaman_developer():
@@ -404,7 +585,7 @@ def halaman_developer():
         st.info("Belum ada data.")
         return
 
-    event = st.dataframe(df, hide_index=True, use_container_width=True,
+    event = st.dataframe(df, hide_index=True, width="stretch",
                          on_select="rerun", selection_mode="single-row")
     baris = event.selection.rows
     if not baris:
@@ -523,12 +704,15 @@ def ubah_tanggal(a) -> str:
     return ""
 
 
-def baca_file(f):
+def baca_file(f, sheet=None):
     """Baca file Kartu Kendali Proses (hasil export app ini atau tulisan manual).
     Return (daftar_langkah, info) dengan info = {'penyamak': ...}.
     Baris yang kolom Waktu-nya digabung (merge) dianggap satu fase."""
     wb = load_workbook(f, data_only=True)
-    ws = wb["Kartu Kendali"] if "Kartu Kendali" in wb.sheetnames else wb.worksheets[0]
+    if sheet:
+        ws = wb[sheet]
+    else:
+        ws = wb["Kartu Kendali"] if "Kartu Kendali" in wb.sheetnames else wb.worksheets[0]
 
     info, mulai = {"penyamak": ""}, None
     for r in range(1, min(ws.max_row, 40) + 1):
@@ -771,7 +955,7 @@ def halaman_user():
             else:
                 rows = hitung_langkah(df, jenis, tahapan, berat, info)
                 st.dataframe(tabel_tampil(rows), hide_index=True,
-                             use_container_width=True, column_config=KONFIG_TABEL)
+                             width="stretch", column_config=KONFIG_TABEL)
                 st.markdown(f"**Total:** {ringkas_satuan(rows)}")
                 st.caption("ml dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 ml.")
                 if st.button("➕ Tambah ke daftar", type="primary"):
@@ -793,7 +977,7 @@ def halaman_user():
             judul += f" · {e['tanggal']}"
         with st.expander(judul):
             st.dataframe(tabel_tampil(e["rows"]), hide_index=True,
-                         use_container_width=True, column_config=KONFIG_TABEL)
+                         width="stretch", column_config=KONFIG_TABEL)
             if st.button("🗑️ Hapus langkah ini", key=f"hapus_{i}"):
                 daftar.pop(i)
                 flash("success", "Langkah dihapus dari daftar.")
