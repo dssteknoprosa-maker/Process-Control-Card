@@ -635,7 +635,6 @@ def halaman_developer():
         return
 
     jenis_list = sorted(df["jenis_kulit"].unique().tolist())
-    tahap_list = list(dict.fromkeys(df["tahapan"].tolist()))
 
     bagian_impor()
 
@@ -644,7 +643,15 @@ def halaman_developer():
     with c1:
         jenis = pilih_atau_baru("Jenis kulit", jenis_list, "jenis")
     with c2:
-        tahapan = pilih_atau_baru("Tahapan", tahap_list, "tahap")
+        # Daftar tahapan hanya milik jenis kulit yang dipilih (bukan semua jenis kulit)
+        try:
+            info_tahap = ambil_info()
+        except DBError:
+            info_tahap = {}
+        jenis_key = rapikan(jenis).title() if jenis != BARU else ""
+        tahap_list = semua_tahapan(df, info_tahap, jenis_key) if jenis_key else []
+        # key mengikuti jenis kulit -> pilihan tahapan ter-refresh tiap ganti jenis kulit
+        tahapan = pilih_atau_baru("Tahapan", tahap_list, f"tahap_{jenis_key}")
     c3, c4, c5, c6 = st.columns([2, 2, 1, 1])
     with c3:
         senyawa = st.text_input("Nama senyawa kimia", key="senyawa")
