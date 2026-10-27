@@ -20,6 +20,7 @@ from openpyxl.styles import Alignment, Border, Font, Side
 from supabase import create_client
 
 TABEL = "formulasi"
+TABEL_URUTAN = "urutan_tahapan"
 KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen", "satuan", "fase"]
 # Faktor konversi dari gram (berat kulit dalam g -> jumlah senyawa dalam g).
 # mL dan L memakai asumsi massa jenis 1 g = 1 mL.
@@ -98,6 +99,17 @@ def ambil_info() -> dict:
             for r in (res.data or [])}
 
 
+def ambil_urutan(ketat: bool = False) -> dict:
+    """Urutan tahapan per (jenis kulit, tahapan). Kalau tabelnya belum ada -> {} (urutan bawaan)."""
+    try:
+        res = jalankan(lambda: db().table(TABEL_URUTAN).select("*").execute())
+    except DBError:
+        if ketat:
+            raise
+        return {}
+    return {(r["jenis_kulit"], r["tahapan"]): int(r["urutan"]) for r in (res.data or [])}
+
+
 def rapikan(teks) -> str:
     return re.sub(r"\s+", " ", (teks or "").strip())
 
@@ -169,12 +181,14 @@ def baca_formulasi(f, sheet=None) -> dict:
     """Ubah file Kartu Kendali Proses menjadi data formulasi + info waktu/keterangan per fase."""
     daftar, info = baca_file(f, sheet)
     rec, info_fase, catatan, langkah, tanpa = [], {}, [], set(), []
+    urut = []
     for e in daftar:
         jenis, tahap = rapikan(e["jenis"]).title(), rapikan(e["tahapan"]).title()
         if (jenis, tahap) in langkah:
             catatan.append(f"{jenis} / {tahap} muncul lebih dari sekali di file; yang pertama dipakai.")
             continue
         langkah.add((jenis, tahap))
+        urut.append((jenis, tahap))
         if not e["rows"]:  # tahapan tanpa bahan kimia
             tb = e.get("tanpa_bahan", {})
             w, k = tb.get("waktu", ""), tb.get("keterangan", "")
@@ -200,7 +214,8 @@ def baca_formulasi(f, sheet=None) -> dict:
     if info.get("gagal"):
         catatan.append(f"{info['gagal']} baris bahan kimia tidak terbaca "
                        "(formatnya harus 'persen (jumlah satuan)').")
-    return {"formulasi": rec, "info": info_fase, "catatan": catatan, "tanpa_bahan": tanpa}
+    return {"formulasi": rec, "info": info_fase, "catatan": catatan, "tanpa_bahan": tanpa,
+            "urutan": urut}
 
 
 def simpan_impor(hasil: dict, mode: str) -> str:
@@ -221,6 +236,21 @@ def simpan_impor(hasil: dict, mode: str) -> str:
         jalankan(lambda: db().table(TABEL).insert(baru).execute())
     for id_, data in ubah:
         jalankan(lambda: db().table(TABEL).update(data).eq("id", id_).execute())
+
+    try:  # urutan tahapan sesuai urutan di file (jenis yang sudah punya urutan dilewati kecuali mode timpa)
+        urut_ada = ambil_urutan(ketat=True)
+        sudah = {j for (j, _) in urut_ada}
+        per_jenis = {}
+        for j, t in hasil.get("urutan", []):
+            if mode == MODE_TIMPA or j not in sudah:
+                per_jenis.setdefault(j, []).append(t)
+        baris_urut = [{"jenis_kulit": j, "tahapan": t, "urutan": i}
+                      for j, ts in per_jenis.items() for i, t in enumerate(ts, 1)]
+        if baris_urut:
+            jalankan(lambda: db().table(TABEL_URUTAN).upsert(
+                baris_urut, on_conflict="jenis_kulit,tahapan").execute())
+    except DBError:
+        pass  # tabel urutan belum dibuat: urutan bisa diatur nanti dari halaman developer
 
     n_info = 0
     try:
@@ -332,15 +362,18 @@ def baca_resep(f, sheet: str, jenis: str) -> dict:
     tahap_raw, tahap_final, terakhir = None, None, None
     kemunculan, data, seen, tanpa, lanjutan = {}, {}, {}, {}, {}
     catatan, kaki, diganti = [], {}, []
+    urut_tahap = []
 
     def nama_unik(raw: str) -> str:
         kunci = raw.casefold()
         kemunculan[kunci] = kemunculan.get(kunci, 0) + 1
         dasar = rapikan(raw).title()
         if kemunculan[kunci] == 1:
+            urut_tahap.append((jenis, dasar))
             return dasar
         akhir = f"{dasar} ({kemunculan[kunci]})"
         diganti.append(f"Tahap '{dasar}' muncul lagi, dinamai '{akhir}'.")
+        urut_tahap.append((jenis, akhir))
         return akhir
 
     for i, x in enumerate(baris):
@@ -433,7 +466,7 @@ def baca_resep(f, sheet: str, jenis: str) -> dict:
     if len(catatan) > 12:
         catatan = catatan[:12] + [f"... dan {len(catatan) - 12} baris lain dilewati."]
     return {"formulasi": rec, "info": info_fase, "catatan": diganti + catatan,
-            "format": "resep", "tanpa_bahan": daftar_tanpa}
+            "format": "resep", "tanpa_bahan": daftar_tanpa, "urutan": urut_tahap}
 
 
 def bagian_impor():
@@ -541,14 +574,19 @@ def bagian_impor():
             st.rerun()
 
 
-def semua_tahapan(df: pd.DataFrame, info: dict, jenis) -> list:
-    """Tahapan untuk satu jenis kulit: yang punya bahan kimia (urut input), lalu yang tanpa bahan."""
+def semua_tahapan(df: pd.DataFrame, info: dict, jenis, urutan: dict | None = None) -> list:
+    """Tahapan satu jenis kulit sesuai urutan proses yang diatur developer.
+    Tahapan yang belum punya urutan ditaruh di belakang: yang berbahan kimia dulu (urut input),
+    lalu yang tanpa bahan kimia."""
     ada = list(dict.fromkeys(df[df["jenis_kulit"] == jenis]["tahapan"])) if not df.empty else []
     tanpa = [t for (j, t, _) in info if j == jenis and t not in ada]
-    return ada + list(dict.fromkeys(tanpa))
+    bawaan = ada + list(dict.fromkeys(tanpa))
+    if urutan is None:
+        urutan = ambil_urutan()
+    return sorted(bawaan, key=lambda t: (urutan.get((jenis, t), float("inf")), bawaan.index(t)))
 
 
-def bagian_info_tahapan(df: pd.DataFrame):
+def bagian_info_tahapan(df: pd.DataFrame, urutan: dict | None = None):
     """Atur waktu & keterangan per fase, atau tahapan tanpa bahan kimia."""
     st.divider()
     st.subheader("Waktu & keterangan per fase / tahapan tanpa bahan kimia")
@@ -571,7 +609,7 @@ def bagian_info_tahapan(df: pd.DataFrame):
     with c1:
         jenis = st.selectbox("Jenis kulit", jenis_opsi, key="info_jenis")
     with c2:
-        pilih = st.selectbox("Tahapan", semua_tahapan(df, info, jenis) + [BARU_TAHAP],
+        pilih = st.selectbox("Tahapan", semua_tahapan(df, info, jenis, urutan) + [BARU_TAHAP],
                              key="info_tahap")
     if pilih == BARU_TAHAP:
         tahapan = rapikan(st.text_input("Nama tahapan baru (tanpa bahan kimia)",
@@ -625,6 +663,52 @@ def bagian_info_tahapan(df: pd.DataFrame):
             hide_index=True, width="stretch")
 
 
+def bagian_urutan_tahapan(df: pd.DataFrame):
+    """Atur urutan proses semua tahapan (termasuk yang tanpa bahan kimia) per jenis kulit."""
+    st.divider()
+    st.subheader("Urutan tahapan")
+    try:
+        info = ambil_info()
+        urutan = ambil_urutan(ketat=True)
+    except DBError as e:
+        st.error(f"❌ {e} (untuk urutan tahapan, jalankan migrasi_urutan_tahapan.sql di Supabase SQL Editor.)")
+        return
+    jenis_opsi = sorted(set(df["jenis_kulit"]) | {j for (j, _, _) in info})
+    if not jenis_opsi:
+        return
+    jenis = st.selectbox("Jenis kulit", jenis_opsi, key="urut_jenis")
+    tahap = semua_tahapan(df, info, jenis, urutan)
+    if not tahap:
+        st.info("Jenis kulit ini belum punya tahapan.")
+        return
+    st.caption("Ubah kolom **No.** sesuai posisi yang diinginkan. Contoh: Aging ingin jadi tahap ke-4 "
+               "-> isi 4, tahapan lain bergeser otomatis. Urutan ini dipakai user di mode Terpandu.")
+    awal = pd.DataFrame({"No.": range(1, len(tahap) + 1), "Tahapan": tahap})
+    ver = st.session_state.get("urut_ver", 0)
+    edit = st.data_editor(
+        awal, hide_index=True, width="stretch", disabled=["Tahapan"],
+        column_config={"No.": st.column_config.NumberColumn("No.", min_value=1, step=1, format="%d")},
+        key=f"urut_editor_{jenis}_{ver}")
+    if st.button("💾 Simpan urutan", key="urut_simpan"):
+        nomor = dict(zip(edit["Tahapan"], edit["No."]))
+        if any(v is None or pd.isna(v) for v in nomor.values()):
+            st.warning("⚠️ Semua nomor harus terisi.")
+            return
+        dasar = [t for t in tahap if int(nomor[t]) == tahap.index(t) + 1]   # tidak diubah
+        pindah = sorted((t for t in tahap if t not in dasar), key=lambda t: (int(nomor[t]), tahap.index(t)))
+        for t in pindah:
+            dasar.insert(min(max(int(nomor[t]) - 1, 0), len(dasar)), t)
+        baris = [{"jenis_kulit": jenis, "tahapan": t, "urutan": i} for i, t in enumerate(dasar, 1)]
+        try:
+            jalankan(lambda: db().table(TABEL_URUTAN).upsert(
+                baris, on_conflict="jenis_kulit,tahapan").execute())
+        except DBError as e:
+            st.error(f"❌ {e}")
+        else:
+            st.session_state["urut_ver"] = ver + 1
+            flash("success", f"✅ Urutan tahapan {jenis} tersimpan.")
+
+
 def bagian_ganti_nama_kulit(df: pd.DataFrame):
     """Ganti nama jenis kulit di semua formulasi + waktu/keterangan tahapannya."""
     st.divider()
@@ -663,6 +747,11 @@ def bagian_ganti_nama_kulit(df: pd.DataFrame):
                     jalankan(lambda: db().table(TABEL).update({"jenis_kulit": lama})
                              .eq("jenis_kulit", baru).execute())
                     raise
+                try:  # urutan tahapan (tabel mungkin belum ada)
+                    jalankan(lambda: db().table(TABEL_URUTAN).update({"jenis_kulit": baru})
+                             .eq("jenis_kulit", lama).execute())
+                except DBError:
+                    pass
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
@@ -691,6 +780,10 @@ def bagian_hapus_jenis_kulit(df: pd.DataFrame):
         try:
             jalankan(lambda: db().table(TABEL).delete().eq("jenis_kulit", jenis).execute())
             jalankan(lambda: db().table("tahapan_info").delete().eq("jenis_kulit", jenis).execute())
+            try:
+                jalankan(lambda: db().table(TABEL_URUTAN).delete().eq("jenis_kulit", jenis).execute())
+            except DBError:
+                pass
         except DBError as e:
             st.error(f"❌ {e}")
         else:
@@ -707,6 +800,7 @@ def halaman_developer():
         return
 
     jenis_list = sorted(df["jenis_kulit"].unique().tolist())
+    urutan_dev = ambil_urutan()
 
     bagian_impor()
 
@@ -721,7 +815,7 @@ def halaman_developer():
         except DBError:
             info_tahap = {}
         jenis_key = rapikan(jenis).title() if jenis != BARU else ""
-        tahap_list = semua_tahapan(df, info_tahap, jenis_key) if jenis_key else []
+        tahap_list = semua_tahapan(df, info_tahap, jenis_key, urutan_dev) if jenis_key else []
         # key mengikuti jenis kulit -> pilihan tahapan ter-refresh tiap ganti jenis kulit
         tahapan = pilih_atau_baru("Tahapan", tahap_list, f"tahap_{jenis_key}")
     c3, c4, c5, c6 = st.columns([2, 2, 1, 1])
@@ -755,7 +849,8 @@ def halaman_developer():
             else:
                 flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%, output {satuan}, fase {int(fase)})")
 
-    bagian_info_tahapan(df)
+    bagian_info_tahapan(df, urutan_dev)
+    bagian_urutan_tahapan(df)
     bagian_ganti_nama_kulit(df)
     bagian_hapus_jenis_kulit(df)
 
@@ -1088,6 +1183,146 @@ def buat_excel(daftar: list, penyamak: str = "") -> bytes:
     return buf.getvalue()
 
 
+def form_manual(df, info, daftar, urutan=None):
+    """Pilih jenis kulit + tahapan secara bebas."""
+    jenis_opsi = sorted(set(df["jenis_kulit"]) | {j for (j, _, _) in info})
+    if not jenis_opsi:
+        st.info("Belum ada formulasi. Hubungi developer.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            jenis = st.selectbox("Jenis kulit", jenis_opsi, index=None,
+                                 placeholder="Pilih jenis kulit")
+        with c2:
+            tahap_opsi = semua_tahapan(df, info, jenis, urutan) if jenis else []
+            tahapan = st.selectbox("Tahapan", tahap_opsi, index=None,
+                                   placeholder="Pilih tahapan")
+        with c3:
+            berat = st.number_input("Berat kulit (g)", min_value=0.0, value=None,
+                                    format="%.2f")
+
+        if jenis and tahapan:
+            ada_bahan = not df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].empty
+            if not ada_bahan:
+                # Tahapan tanpa bahan kimia: berat kulit tidak diperlukan
+                w, k = info.get((jenis, tahapan, 1), ("", ""))
+                st.info(f"Tahapan tanpa bahan kimia · Waktu: {w or '-'} menit · "
+                        f"Keterangan: {k or '-'}")
+                if st.button("➕ Tambah ke daftar", type="primary"):
+                    daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
+                                   "tahapan": tahapan, "berat": None, "rows": [],
+                                   "tanpa_bahan": {"waktu": w, "keterangan": k}})
+                    flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
+            elif berat is None or berat <= 0:
+                st.info("Masukkan berat kulit (g) lebih dari 0.")
+            else:
+                rows = hitung_langkah(df, jenis, tahapan, berat, info)
+                st.dataframe(tabel_tampil(rows), hide_index=True,
+                             width="stretch", column_config=KONFIG_TABEL)
+                st.markdown(f"**Total:** {ringkas_satuan(rows)}")
+                st.caption("ml dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 ml.")
+                if st.button("➕ Tambah ke daftar", type="primary"):
+                    daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
+                                   "tahapan": tahapan, "berat": float(berat),
+                                   "rows": rows.to_dict("records")})
+                    flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
+
+
+def _loncat_tahap(urutan: list):
+    st.session_state["gd_idx"] = urutan.index(st.session_state["gd_loncat"])
+
+
+def form_terpandu(df, info, daftar, jenis_opsi, urutan=None):
+    """Jalani tahapan satu per satu sesuai urutan; tidak perlu memilih tahapan manual."""
+    if not jenis_opsi:
+        st.info("Belum ada formulasi. Hubungi developer.")
+        return
+    jenis = st.selectbox("Jenis kulit", jenis_opsi, index=None,
+                         placeholder="Pilih jenis kulit", key="gd_jenis")
+    if not jenis:
+        st.info("Pilih jenis kulit, lalu ikuti tahapannya satu per satu.")
+        return
+    daftar_tahap = semua_tahapan(df, info, jenis, urutan)
+    if not daftar_tahap:
+        st.info("Jenis kulit ini belum punya tahapan.")
+        return
+    if st.session_state.get("gd_jenis_aktif") != jenis:  # ganti jenis kulit -> tanya titik mulai lagi
+        st.session_state["gd_jenis_aktif"] = jenis
+        st.session_state["gd_idx"] = 0
+        st.session_state["gd_siap"] = False
+    if not st.session_state.get("gd_siap"):
+        st.markdown("#### 👋 Selamat datang!")
+        st.markdown("**Hari ini proses pengolahan dimulai dari tahapan apa?** 🧪")
+        mulai = st.selectbox("Tahapan awal", daftar_tahap, key=f"gd_mulai_{jenis}",
+                             help="Pilih tahapan pertama yang akan dikerjakan hari ini. "
+                                  "Tahapan berikutnya akan mengikuti urutan proses.")
+        if st.button("▶️ Mulai", key="gd_mulai_btn", type="primary"):
+            st.session_state["gd_idx"] = daftar_tahap.index(mulai)
+            st.session_state["gd_siap"] = True
+            st.rerun()
+        return
+    idx = min(max(int(st.session_state.get("gd_idx", 0)), 0), len(daftar_tahap))
+
+    st.progress(idx / len(daftar_tahap), text=f"{idx} dari {len(daftar_tahap)} tahap selesai")
+    st.caption(" → ".join(("✅ " if i < idx else "👉 " if i == idx else "") + t
+                          for i, t in enumerate(daftar_tahap)))
+    with st.expander("Mulai / loncat ke tahap lain"):
+        st.session_state["gd_loncat"] = daftar_tahap[min(idx, len(daftar_tahap) - 1)]
+        st.selectbox("Tahap", daftar_tahap, key="gd_loncat",
+                     on_change=_loncat_tahap, args=(daftar_tahap,))
+
+    if idx >= len(daftar_tahap):
+        st.success("🎉 Semua tahapan selesai. Export Kartu Kendali ada di bawah.")
+        if st.button("↩️ Mulai sesi baru", key="gd_ulang"):
+            st.session_state["gd_idx"] = 0
+            st.session_state["gd_siap"] = False
+            st.rerun()
+        return
+
+    tahapan = daftar_tahap[idx]
+    st.markdown(f"### Tahap {idx + 1} dari {len(daftar_tahap)}: {tahapan}")
+    ada_bahan = not df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].empty
+    rows, berat, siap = None, None, True
+    if ada_bahan:
+        # berat default = berat langkah terakhir di daftar (bisa diubah, mis. setelah shaving)
+        default = next((e["berat"] for e in reversed(daftar) if e.get("berat")), None)
+        berat = st.number_input("Berat kulit (g)", min_value=0.0, value=default,
+                                format="%.2f", key=f"gd_berat_{jenis}_{idx}")
+        if berat is None or berat <= 0:
+            st.info("Masukkan berat kulit (g) lebih dari 0.")
+            siap = False
+        else:
+            rows = hitung_langkah(df, jenis, tahapan, berat, info)
+            st.dataframe(tabel_tampil(rows), hide_index=True,
+                         width="stretch", column_config=KONFIG_TABEL)
+            st.markdown(f"**Total:** {ringkas_satuan(rows)}")
+            st.caption("ml dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 ml.")
+    else:
+        w, k = info.get((jenis, tahapan, 1), ("", ""))
+        st.info(f"Tahapan tanpa bahan kimia · Waktu: {w or '-'} menit · Keterangan: {k or '-'}")
+
+    cb, cs, ct = st.columns([1, 1, 2])
+    if cb.button("⬅️ Kembali", key="gd_back", disabled=idx == 0, width="stretch"):
+        st.session_state["gd_idx"] = idx - 1
+        st.rerun()
+    if cs.button("⏭️ Lewati", key="gd_skip", width="stretch"):
+        st.session_state["gd_idx"] = idx + 1
+        st.rerun()
+    if ct.button("✅ Tambah ke daftar & lanjut", key="gd_next", type="primary",
+                 disabled=not siap, width="stretch"):
+        if ada_bahan:
+            daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis, "tahapan": tahapan,
+                           "berat": float(berat), "rows": rows.to_dict("records")})
+        else:
+            w, k = info.get((jenis, tahapan, 1), ("", ""))
+            daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis, "tahapan": tahapan,
+                           "berat": None, "rows": [], "tanpa_bahan": {"waktu": w, "keterangan": k}})
+        st.session_state["gd_idx"] = idx + 1
+        flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
+    st.caption("Kembali / Lewati tidak menghapus langkah yang sudah masuk daftar; "
+               "hapus langkah di 'Daftar langkah' bila perlu.")
+
+
 def halaman_user():
     st.title("Hitung Kebutuhan Bahan Kimia")
     tampil_flash()
@@ -1131,49 +1366,15 @@ def halaman_user():
 
     penyamak = st.text_input("Penyamak (contoh: PKL UGM, magang, dll)", key="penyamak")
 
-    # --- Hitung satu langkah ---
+    # --- Tambah langkah ---
     st.subheader("Tambah langkah")
     jenis_opsi = sorted(set(df["jenis_kulit"]) | {j for (j, _, _) in info})
-    if not jenis_opsi:
-        st.info("Belum ada formulasi. Hubungi developer.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            jenis = st.selectbox("Jenis kulit", jenis_opsi, index=None,
-                                 placeholder="Pilih jenis kulit")
-        with c2:
-            tahap_opsi = semua_tahapan(df, info, jenis) if jenis else []
-            tahapan = st.selectbox("Tahapan", tahap_opsi, index=None,
-                                   placeholder="Pilih tahapan")
-        with c3:
-            berat = st.number_input("Berat kulit (g)", min_value=0.0, value=None,
-                                    format="%.2f")
-
-        if jenis and tahapan:
-            ada_bahan = not df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].empty
-            if not ada_bahan:
-                # Tahapan tanpa bahan kimia: berat kulit tidak diperlukan
-                w, k = info.get((jenis, tahapan, 1), ("", ""))
-                st.info(f"Tahapan tanpa bahan kimia · Waktu: {w or '-'} menit · "
-                        f"Keterangan: {k or '-'}")
-                if st.button("➕ Tambah ke daftar", type="primary"):
-                    daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
-                                   "tahapan": tahapan, "berat": None, "rows": [],
-                                   "tanpa_bahan": {"waktu": w, "keterangan": k}})
-                    flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
-            elif berat is None or berat <= 0:
-                st.info("Masukkan berat kulit (g) lebih dari 0.")
-            else:
-                rows = hitung_langkah(df, jenis, tahapan, berat, info)
-                st.dataframe(tabel_tampil(rows), hide_index=True,
-                             width="stretch", column_config=KONFIG_TABEL)
-                st.markdown(f"**Total:** {ringkas_satuan(rows)}")
-                st.caption("ml dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 ml.")
-                if st.button("➕ Tambah ke daftar", type="primary"):
-                    daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
-                                   "tahapan": tahapan, "berat": float(berat),
-                                   "rows": rows.to_dict("records")})
-                    flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
+    urutan = ambil_urutan()
+    tab_t, tab_m = st.tabs(["🧭 Terpandu (urut)", "✋ Manual"])
+    with tab_t:
+        form_terpandu(df, info, daftar, jenis_opsi, urutan)
+    with tab_m:
+        form_manual(df, info, daftar, urutan)
 
     # --- Daftar langkah + export ---
     st.divider()
