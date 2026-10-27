@@ -625,6 +625,50 @@ def bagian_info_tahapan(df: pd.DataFrame):
             hide_index=True, width="stretch")
 
 
+def bagian_ganti_nama_kulit(df: pd.DataFrame):
+    """Ganti nama jenis kulit di semua formulasi + waktu/keterangan tahapannya."""
+    st.divider()
+    st.subheader("Ganti nama jenis kulit")
+    try:
+        info = ambil_info()
+    except DBError as e:
+        st.error(f"❌ {e}")
+        return
+    jenis_opsi = sorted(set(df["jenis_kulit"]) | {j for (j, _, _) in info})
+    if not jenis_opsi:
+        return
+    st.caption("Nama baru berlaku untuk semua bahan kimia dan waktu & keterangan "
+               "pada jenis kulit tersebut. Nama baru tidak boleh sama dengan jenis kulit yang sudah ada.")
+    c1, c2 = st.columns(2)
+    with c1:
+        lama = st.selectbox("Jenis kulit yang diganti", jenis_opsi, key="ren_lama")
+    with c2:
+        baru = rapikan(st.text_input("Nama baru", key=f"ren_baru_{lama}")).title()
+    if st.button("✏️ Ganti nama jenis kulit"):
+        if not baru:
+            st.warning("⚠️ Isi nama baru.")
+        elif baru == lama:
+            st.warning("⚠️ Nama baru sama dengan nama lama.")
+        elif baru in jenis_opsi:
+            st.warning(f"⚠️ '{baru}' sudah ada. Pilih nama lain.")
+        else:
+            try:
+                jalankan(lambda: db().table(TABEL).update({"jenis_kulit": baru})
+                         .eq("jenis_kulit", lama).execute())
+                try:
+                    jalankan(lambda: db().table("tahapan_info").update({"jenis_kulit": baru})
+                             .eq("jenis_kulit", lama).execute())
+                except DBError:
+                    # kembalikan supaya data tidak setengah berubah
+                    jalankan(lambda: db().table(TABEL).update({"jenis_kulit": lama})
+                             .eq("jenis_kulit", baru).execute())
+                    raise
+            except DBError as e:
+                st.error(f"❌ {e}")
+            else:
+                flash("success", f"✅ Jenis kulit '{lama}' diganti menjadi '{baru}'.")
+
+
 def halaman_developer():
     st.title("Developer: Kelola Formulasi")
     tampil_flash()
@@ -684,6 +728,7 @@ def halaman_developer():
                 flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%, output {satuan}, fase {int(fase)})")
 
     bagian_info_tahapan(df)
+    bagian_ganti_nama_kulit(df)
 
     st.divider()
     st.subheader("Data formulasi (klik satu baris untuk edit / hapus)")
