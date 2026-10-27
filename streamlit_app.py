@@ -669,6 +669,34 @@ def bagian_ganti_nama_kulit(df: pd.DataFrame):
                 flash("success", f"✅ Jenis kulit '{lama}' diganti menjadi '{baru}'.")
 
 
+def bagian_hapus_jenis_kulit(df: pd.DataFrame):
+    """Hapus satu jenis kulit beserta seluruh bahan kimia dan waktu & keterangannya."""
+    st.divider()
+    st.subheader("Hapus jenis kulit")
+    try:
+        info = ambil_info()
+    except DBError as e:
+        st.error(f"❌ {e}")
+        return
+    jenis_opsi = sorted(set(df["jenis_kulit"]) | {j for (j, _, _) in info})
+    if not jenis_opsi:
+        return
+    jenis = st.selectbox("Jenis kulit yang dihapus", jenis_opsi, key="hapus_jenis")
+    n_bahan = int((df["jenis_kulit"] == jenis).sum())
+    n_info = sum(1 for (j, _, _) in info if j == jenis)
+    st.warning(f"⚠️ Akan menghapus **{jenis}** secara permanen: {n_bahan} baris bahan kimia dan "
+               f"{n_info} data waktu & keterangan. Tindakan ini tidak bisa dibatalkan.")
+    ya = st.checkbox(f"Ya, hapus semua data {jenis}", key=f"hapus_ok_{jenis}")
+    if st.button("🗑️ Hapus jenis kulit", disabled=not ya):
+        try:
+            jalankan(lambda: db().table(TABEL).delete().eq("jenis_kulit", jenis).execute())
+            jalankan(lambda: db().table("tahapan_info").delete().eq("jenis_kulit", jenis).execute())
+        except DBError as e:
+            st.error(f"❌ {e}")
+        else:
+            flash("success", f"🗑️ Jenis kulit '{jenis}' dihapus ({n_bahan} bahan kimia, {n_info} data waktu).")
+
+
 def halaman_developer():
     st.title("Developer: Kelola Formulasi")
     tampil_flash()
@@ -729,6 +757,7 @@ def halaman_developer():
 
     bagian_info_tahapan(df)
     bagian_ganti_nama_kulit(df)
+    bagian_hapus_jenis_kulit(df)
 
     st.divider()
     st.subheader("Data formulasi (klik satu baris untuk edit / hapus)")
