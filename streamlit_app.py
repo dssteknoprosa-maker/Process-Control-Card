@@ -469,6 +469,43 @@ def baca_resep(f, sheet: str, jenis: str) -> dict:
             "format": "resep", "tanpa_bahan": daftar_tanpa, "urutan": urut_tahap}
 
 
+def nama_dari_sheet(nama: str) -> str:
+    """Nama sheet -> usulan jenis kulit; nama generik (Sheet1, dst) dikosongkan."""
+    if re.fullmatch(r"(sheet|lembar|worksheet)\s*\d*", nama.strip(), re.I):
+        return ""
+    return rapikan(nama).title()
+
+
+def gabung_hasil(daftar: list) -> dict:
+    """Gabungkan hasil baca beberapa sheet/file menjadi satu hasil impor."""
+    formulasi, info, catatan, tanpa, urutan = [], {}, [], [], []
+    ada, ada_tanpa, ada_urut = set(), set(), set()
+    for h in daftar:
+        for r in h["formulasi"]:
+            kunci = (r["jenis_kulit"], r["tahapan"], r["senyawa"].lower())
+            if kunci in ada:
+                catatan.append(f"{r['jenis_kulit']} / {r['tahapan']} / {r['senyawa']}: "
+                               "muncul di lebih dari satu sheet, yang pertama dipakai.")
+                continue
+            ada.add(kunci)
+            formulasi.append(r)
+        for t in h.get("tanpa_bahan", []):
+            kunci = (t["jenis_kulit"], t["tahapan"])
+            if kunci not in ada_tanpa:
+                ada_tanpa.add(kunci)
+                tanpa.append(t)
+        for k, v in h["info"].items():
+            info.setdefault(k, v)
+        for u in h.get("urutan", []):
+            if u not in ada_urut:
+                ada_urut.add(u)
+                urutan.append(u)
+        catatan += h["catatan"]
+    return {"formulasi": formulasi, "info": info, "catatan": catatan, "tanpa_bahan": tanpa,
+            "urutan": urutan,
+            "format": "resep" if any(h.get("format") == "resep" for h in daftar) else "kartu"}
+
+
 def bagian_impor():
     """Impor formulasi dari file Kartu Kendali Proses atau file Resep (.xlsx)."""
     n = st.session_state.get("imp_n", 0)
@@ -479,39 +516,60 @@ def bagian_impor():
                    "Keterangan). Sel Waktu yang digabung dianggap satu fase. Tahapan tanpa bahan "
                    "kimia (mis. Aging, Shaving) ikut terdeteksi, hanya berisi waktu & keterangan. "
                    "Hasilnya bisa dicek dulu sebelum disimpan.")
-        f = st.file_uploader("File Excel (.xlsx)", type=["xlsx"], key=f"imp_{n}")
-        sheet, fmt, jenis_manual = None, None, ""
-        if f is not None:
+        files = st.file_uploader("File Excel (.xlsx), boleh pilih banyak file sekaligus",
+                                 type=["xlsx"], accept_multiple_files=True, key=f"imp_{n}")
+        sumber, baris = [], []
+        for f in files or []:
             try:
                 deteksi = deteksi_format(f)
             except Exception as e:  # noqa: BLE001
-                deteksi = {}
-                st.error(f"❌ Gagal membuka file: {str(e)[:200]}")
+                st.error(f"❌ Gagal membuka {f.name}: {str(e)[:200]}")
+                continue
             if not deteksi:
-                st.warning("Format file tidak dikenali. Header tabel harus 'Tanggal | Proses' "
+                st.warning(f"{f.name}: format tidak dikenali. Header tabel harus 'Tanggal | Proses' "
                            "(Kartu Kendali) atau 'Tahap | Bahan' (Resep).")
-            else:
-                sheet = (st.selectbox("Sheet", list(deteksi), key=f"imp_sheet_{n}")
-                         if len(deteksi) > 1 else next(iter(deteksi)))
-                fmt = deteksi[sheet]
-                st.caption("Format terdeteksi: " + ("Kartu Kendali Proses" if fmt == "kartu"
-                                                   else "Resep (Tahap | Bahan | Jumlah)"))
-                if fmt == "resep":
-                    jenis_manual = rapikan(st.text_input(
-                        "Jenis kulit untuk resep ini (tidak ada di file)", key=f"imp_jenis_{n}",
-                        placeholder="contoh: Biawak"))
-        if fmt and st.button("🔍 Baca file"):
-            st.session_state["imp_ver"] = st.session_state.get("imp_ver", 0) + 1
-            try:
-                if fmt == "resep":
-                    if not jenis_manual:
-                        raise ValueError("Isi dulu jenis kulit untuk resep ini.")
-                    st.session_state["impor"] = baca_resep(f, sheet, jenis_manual.title())
+                continue
+            for sh, fm in deteksi.items():
+                sumber.append((f, sh, fm))
+                baris.append({"Impor": True, "File": f.name, "Sheet": sh,
+                              "Format": "Kartu Kendali" if fm == "kartu" else "Resep",
+                              "Jenis Kulit": "(dari file)" if fm == "kartu" else nama_dari_sheet(sh)})
+        if baris:
+            sig = abs(hash(tuple((f.name, f.size) for f in files)))
+            edit_src = st.data_editor(
+                pd.DataFrame(baris), hide_index=True, width="stretch",
+                disabled=["File", "Sheet", "Format"],
+                column_config={"Impor": st.column_config.CheckboxColumn("Impor"),
+                               "Jenis Kulit": st.column_config.TextColumn(
+                                   "Jenis Kulit", help="Hanya untuk sheet Resep. Default: nama sheet.")},
+                key=f"imp_tab_{n}_{sig}")
+            st.caption("Setiap sheet = satu jenis kulit. Sheet **Resep** tidak punya nama kulit di dalam "
+                       "file, jadi dipakai nama sheet (bisa diubah di kolom Jenis Kulit). Sheet **Kartu "
+                       "Kendali** membaca jenis kulitnya dari file. Hilangkan centang untuk melewati sheet.")
+            if st.button("🔍 Baca file"):
+                st.session_state["imp_ver"] = st.session_state.get("imp_ver", 0) + 1
+                hasil_list, gagal = [], []
+                for i, row in edit_src.iterrows():
+                    if not row["Impor"]:
+                        continue
+                    f, sh, fm = sumber[i]
+                    try:
+                        if fm == "resep":
+                            jenis_resep = rapikan(row["Jenis Kulit"]).title()
+                            if not jenis_resep:
+                                raise ValueError("Jenis Kulit belum diisi.")
+                            hasil_list.append(baca_resep(f, sh, jenis_resep))
+                        else:
+                            hasil_list.append(baca_formulasi(f, sh))
+                    except Exception as e:  # noqa: BLE001
+                        gagal.append(f"{f.name} / {sh}: gagal dibaca ({str(e)[:200]})")
+                if hasil_list:
+                    gab = gabung_hasil(hasil_list)
+                    gab["catatan"] = gagal + gab["catatan"]
+                    st.session_state["impor"] = gab
                 else:
-                    st.session_state["impor"] = baca_formulasi(f, sheet)
-            except Exception as e:  # noqa: BLE001
-                st.session_state.pop("impor", None)
-                st.error(f"❌ Gagal membaca file: {str(e)[:250]}")
+                    st.session_state.pop("impor", None)
+                    st.error("❌ Tidak ada sheet yang berhasil dibaca. " + " ".join(gagal))
 
         hasil = st.session_state.get("impor")
         if not hasil:
@@ -524,6 +582,14 @@ def bagian_impor():
                    if formulasi else 0)
         st.success(f"Terdeteksi {len(formulasi)} bahan kimia di {n_tahap} tahapan, "
                    f"dan {len(tanpa)} tahapan tanpa bahan kimia.")
+        urut_file = hasil.get("urutan", [])
+        if urut_file:
+            with st.expander("🔢 Urutan tahapan terdeteksi dari file"):
+                for j in dict.fromkeys(j for j, _ in urut_file):
+                    st.markdown(f"**{j}:** " + " → ".join(
+                        f"{i}. {t}" for i, t in enumerate((t for jj, t in urut_file if jj == j), 1)))
+                st.caption("Urutan ini ikut disimpan saat impor (butuh tabel urutan_tahapan dari "
+                           "migrasi_urutan_tahapan.sql). Bisa diubah lagi di bagian 'Urutan tahapan'.")
         if hasil.get("format") == "resep" and formulasi:
             st.info("File resep tidak punya satuan. Default: Air = mL, bahan lain = g. "
                     "Ubah langsung di kolom Satuan pada tabel di bawah kalau perlu.")
